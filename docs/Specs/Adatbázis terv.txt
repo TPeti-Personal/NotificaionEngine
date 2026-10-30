@@ -1,0 +1,57 @@
+			┌───────────────────────────────────────────┐
+			│                   users					│
+			├───────────────────────────────────────────┤
+	┌───────┤ id         : UUID (PK)					│
+	│		│ email      : VARCHAR(255) (UNIQUE)		│
+	│		│ first_name : VARCHAR(100)					│
+	│		│ last_name  : VARCHAR(100)					│
+	│		│ created_at : TIMESTAMP WITH TIME ZONE		│
+	│		│ updated_at : TIMESTAMP WITH TIME ZONE		│
+	│		└───────────────────────────────────────────┘
+	│
+	│   1:N (ON DELETE CASCADE)
+	├───┐
+	│	│	┌───────────────────────────────────────────┐
+	│	│	│             user_integrations				│
+	│	│	├───────────────────────────────────────────┤
+	│	│	│ id         : UUID (PK)					│
+	│	└──►│ user_id    : UUID (FK -> users.id)		│
+	│		│ provider   : VARCHAR(50)					│
+	│		│ credentials: JSONB						│
+	│		│ is_active  : BOOLEAN						│
+	│		│ created_at : TIMESTAMP WITH TIME ZONE		│
+	│		│ updated_at : TIMESTAMP WITH TIME ZONE		│
+	│		├───────────────────────────────────────────┤
+	│		│ UK: [user_id, provider]					│
+	│		│ IDX: [user_id, provider] WHERE active		│
+	│		└───────────────────────────────────────────┘
+	│
+	│   1:N (ON DELETE CASCADE)
+	└───┐
+		│	┌───────────────────────────────────────────┐
+		│	│                alert_rules				│
+		│	├───────────────────────────────────────────┤
+		│	│ id           : UUID (PK)					│◄──┐
+		└──►│ user_id      : UUID (FK -> users.id)		│	│
+			│ name         : VARCHAR(150)				│	│
+			│ topic_pattern: VARCHAR(100)				│	│
+			│ conditions   : JSONB						│	│
+			│ is_enabled   : BOOLEAN					│	│
+			│ created_at   : TIMESTAMP WITH TIME ZONE	│	│
+			│ updated_at   : TIMESTAMP WITH TIME ZONE	│	│
+			├───────────────────────────────────────────┤	│
+			│ IDX: [topic_pattern] WHERE enabled		│	│
+			└───────────────────────────────────────────┘	│
+															│ 1:N (ON DELETE CASCADE)
+															│
+			┌───────────────────────────────────────────┐	│
+			│             alert_channels                │	│
+			├───────────────────────────────────────────┤	│
+			│ id             : UUID (PK)                │	│
+			│ alert_rule_id  : UUID (FK -> rules.id)	├───┘
+			│ channel_type   : VARCHAR(50)              │
+			│ channel_config : JSONB                    │
+			│ created_at     : TIMESTAMP WITH TIME ZONE	│
+			├───────────────────────────────────────────┤
+			│ UK: [alert_rule_id, channel_type]         │
+			└───────────────────────────────────────────┘

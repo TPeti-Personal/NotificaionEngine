@@ -1,0 +1,54 @@
+ARCHITEKTÚRA TERV
+=================
+
+Tervezési szempontok:
+
+ - Rugalmasan bővíthető, skálázható rendszer:
+ 	Microservice arhitectúra: .Net Core C# backend
+	
+ - Minimális késleltetésű (real-time) jelfeldolgozás, Dinamikus Adatáramlás (Data Flow):
+	MessageQueue használata: RabbitMQ + Topic Exchange
+	
+ - Gyors adatbázis kezelés:
+	PostgreSQL - JSON formátumú mezők jobb (és gyorsabb) kezelése miatt
+	Cache Startegy - Ha a későbbiekben szükséges lenne az adatbázis kezelés gyorsítása
+
+---------------------------------------------------------------------------------------------------------
+
+
+[ Külső API Ingestorok ] 
+         │ (Push/Poll)
+         ▼
+ ┌──────────────────────────────────────────────┐
+ │ RabbitMQ Topic Exchange: 'event-rules' 		│
+ │       │                                		│		┌───────────────────────────────────────────────────┐		
+ │       └──► [Message broker]            		│		│ Core.Rule.Engine Service							│
+ │				│                               │		│													│
+ │				├──► [Queue: news.all] ───────►	│ ────►	│ ─► [consumer.news] ───┐							│
+ │				├──► [Queue: market.all] ─────►	│ ────►	│ ─► [consumer.all] ────┤							│
+ │				└──► [Queue: other.all] ──────►	│ ────►	│ ─► [consumer.other] ──┤							│
+ │						(további bővíthetőség)	│		│						│							│
+ └──────────────────────────────────────────────┘		│			┌───────────┘							│
+														│			▼										│
+														│ [User alert filtering] ─────► [IRepository] ───── │ ───► [EF Core: PostgreSQL DB] 
+														│	releváns alert-ek				│				│		▲
+														│	szűrése:						▼				│		│
+														│	  - topic_pattern			[Cache Strategy] ◄─ │ ──────┘
+														│	  - conditions			  (további fejlesztési	│
+														│			│						lehetőség)		│	
+														│			▼										│
+														│	[User dispaching]								│
+														│			│ (alert_channels alapján)				│
+		 ┌───────────────────────────────────────────── │ ◄─────────┘										│
+		 ▼												└───────────────────────────────────────────────────┘
+ ┌──────────────────────────────────────────────┐	    
+ │ RabbitMQ Fanout Exchange: 'dispatch' 		│
+ │       │                                		│
+ │       └──► [Message broker]            		│	┌──► [Email Worker Service] ─────► Email kiküldés (pl. SendGrid)
+ │				│                               │	│
+ │				├──► [Queue: email] ──────────►	│ ──┘
+ │				├──► [Queue: slack] ──────────►	│ ─────► [Slack Worker Service] ─────► Slack értesítés kiküldés (Slack.Api hívás)
+ │				└──► [Queue: other...] ───────►	│ ──┐
+ │						(további bővíthetőség)	│	│
+ └──────────────────────────────────────────────┘	└──► [Other... Worker Service] ──► Egyéb értesítés kiküldés (további bővíthetőség)
+
