@@ -1,0 +1,298 @@
+PROJEKT INDÍTÁS
+---------------
+
+Adott egy ilyen brief:
+"We want users to be able to set up alerts so they get notified when
+something important happens in the world — like breaking news, market
+movements, natural disasters, that kind of thing. Should work for both email
+and Slack. Make it flexible enough that we can add more channels later.
+We need an admin view too."
+Hogyan kezdenél neki a feladatnak?
+
+-----
+
+Egy ilyen feladatnak egy strukturált architektúra-tervezéssel és a követelmények pontosításával kezdenék neki. A brief egy klasszikus, eseményvezérelt értesítési rendszert (Notification Engine) ír le, ahol a legfontosabb szempont a flexibilitás és a skálázhatóság (az új csatornák könnyű integrálhatósága miatt).
+A munkát az alábbi 4 fő fázisra bontanám:
+
+1. Követelmények pontosítása (Tisztázó kérdések a business/product felé)
+
+Mielőtt bármit kódolnék, meg kell érteni a határokat:
+• Valós idő vs. Batch: A "breaking news" és a "market movements" azonnali (real-time) értesítést igényel, vagy elég perces/órás aggregáció?
+• Adatforrás: Mi generálja az eseményeket? Külső API-k (pl. Reuters, Bloomberg), vagy a mi belső rendszerünk?
+• Admin funkciók: Az admin nézetben globális értesítéseket akarnak kiküldeni (pl. rendszerüzenet), vagy a felhasználói szabályokat/sablonokat akarják menedzselni?
+• Terhelés: Hány felhasználóra és másodpercenként hány bejövő eseményre (throughput) kell méretezni?
+
+2. Architektúra és Rendszerterv (A rugalmasság kulcsa)
+
+A bővíthetőség miatt egy Mikroszolgáltatás (Microservice) vagy Eseményvezérelt (Event-Driven) architektúrát választanék, ahol a csatornák le vannak választva a logikáról.
+[Esemény Forrás] (News/Market API)
+       │
+       ▼
+[Event Broker / Message Queue] (Kafka / RabbitMQ)
+       │
+       ▼
+[Notification Core Service] (Szabályok ellenőrzése, Sablonok kezelése)
+       │
+       ├─────────────────────────┐
+       ▼                         ▼
+[Email Provider Worker]   [Slack Integration Worker]  --> [Jövőbeli Csatorna (pl. SMS/Push)]
+(SendGrid / AWS SES)       (Slack Webhook/Bot)
+
+Főbb komponensek:
+
+• Ingestion API / Message Queue (pl. Kafka, RabbitMQ): Ide futnak be a világ eseményei. A sorba rendezés biztosítja, hogy ha hirtelen összeomlik a tőzsde és dőlnek az adatok, a rendszer ne haljon le, hanem pufferelni tudja az üzeneteket.
+• Notification Core Service: Ez a rendszer "agya".
+	• Lekéri a felhasználói beállításokat (Ki, mire, hol kért értesítést).
+	• Összepárosítja az eseményt a felhasználóval.
+	• Átadja az üzenetet a megfelelő "Worker"-nek.
+• Provider/Channel Workers (A flexibilitás alapja): Különálló, kisméretű szolgáltatások csatornánként.
+	• Külön Worker kezeli az Emaileket és külön a Slacket.
+	• Miért jó ez? Ha később bejön a Discord vagy az SMS (Twilio), csak egy új Workert kell írni, ami a közös üzenet-formátumot lefordítja a Discord/SMS API nyelvére. A magrendszerhez hozzá sem kell nyúlni.
+
+3. Adatmodell tervezés (Relációs vagy NoSQL)
+
+Szükség lesz egy adatbázisra (pl. PostgreSQL) az alábbi entitásokkal:
+• Users & Workspace: Felhasználók adatai és a Slack integrációs tokenek.
+• Alert Configurations / Rules: A felhasználó szabályai (pl. User X kért "Market Movement" riasztást, ha a BTC változása > 5%, Csatorna: Slack).
+• Notification Templates: Dinamikus sablonok (pl. HTML emailhez és JSON a Slack Block Kit-hez), amik behelyettesítik az esemény adatait.
+
+4. Az Admin Nézet (Admin View) funkciói
+
+Az admin felületnek a következőket kellene tudnia a brief alapján:
+• Sablonkezelő (Template Manager): Az adminok szerkeszthessék a kiküldött üzenetek szövegét és kinézetét kódmódosítás nélkül.
+• Globális Override / Kényszerített értesítések: Lehetőség arra, hogy az admin egy kritikus eseményt (pl. katasztrófa) minden felhasználónak kiküldjön, függetlenül a saját beállításuktól.
+• Audit Log & Analytics: Látni kell, hogy hány értesítés ment ki, sikeres volt-e, vagy volt-e kézbesítési hiba (pl. hibás Slack webhook).
+
+Hogyan kezdeném el a gyakorlatban (Next Steps)?
+
+Első lépésként egy Proof of Concept (PoC) verziót építenék:
+1. Létrehoznék egy egyszerű belső API-t, ami szimulálja a híreket.
+2. Bevezetnék egy közös interface-t (pl. NotificationProvider), amit az Email és Slack osztályok valósítanak meg.
+3. Kiküldenék egy manuálisan triggerelt "Breaking News" tesztet mindkét csatornára, hogy lássam az integrációk működését.
+Melyik résszel kezdenéd legszívesebben a részletesebb tervezést?
+• A Slack/Email integráció technikai megvalósításával (pl. hogyan hitelesítjük a workspace-eket)?
+• Az adatbázis-modell felvázolásával, ami kezeli a rugalmas szabályokat?
+• Vagy az admin felület drótvázaival és funkciólistájával?
+
+
+
+------------------------------------------------------
+
+1. Követelmények pontosítása:
+- valós idő vs. batch - azonnali (real-time) értesítések kellenek
+- Adatforrás: külső api-k
+- Az admin funkciókat és a terhelést most engedjük el tervezési fázisban.
+
+Architektúra: Microservice architektúra, RabbitMQ -val a bejövő események gyűjtésére.
+
+Ezek alapján pontosítsd a rendszertervet
+
+-----
+
+A pontosított peremfeltételek alapján a rendszer fókusza a minimális késleltetésű (real-time) jelfeldolgozás és a RabbitMQ-ra épülő aszinkron, rugalmas üzenetkezelés. Mivel az admin funkciókat és a terhelést most elengedjük, egy tiszta, funkcionális magarchitektúrát hozunk létre.
+Íme a finomított rendszerterv:
+
+1. Dinamikus Adatáramlás (Data Flow) és RabbitMQ Architektúra
+
+A valós idejű működés és a külső API-k kezelése miatt a RabbitMQ-ban Topic Exchange-et érdemes használni. Ez lehetővé teszi, hogy az eseményeket típus (pl. news.breaking, market.crypto, disaster.earthquake) alapján routing kulcsokkal lássuk el, így a rendszer csak azokat a szabályokat futtatja le, amik a specifikus témára vonatkoznak.
+[ Külső API Ingestorok ] 
+         │ (Push/Poll)
+         ▼
+ ┌────────────────────────────────────────┐
+ │ RabbitMQ Topic Exchange: 'event-rules' │
+ └────────────────────────────────────────┘
+         │
+         ├──► [Queue: news.all] ─────► [Core Rule Engine Service]
+         └──► [Queue: market.all] ───┘           │
+                                                 │ (User filterek lefutnak)
+                                                 ▼
+                                ┌──────────────────────────────────────┐
+                                │ RabbitMQ Fanout Exchange: 'dispatch' │
+                                └──────────────────────────────────────┘
+                                                 │
+                        ┌────────────────────────┴────────────────────────┐
+                        ▼                                                 ▼
+            [Queue: email-delivery]                           [Queue: slack-delivery]
+                        │                                                 │
+                        ▼                                                 ▼
+            [Email Worker Service]                            [Slack Worker Service]
+                        │                                                 │
+                        ▼ (Azonnali I/O)                                  ▼ (Azonnali I/O)
+                   [SendGrid]                                        [Slack API]
+
+2. A Mikroszolgáltatások (Microservices) pontos feladatai
+
+A rendszer 4 főbb, egymástól teljesen függetlenül skálázható mikroszolgáltatásra bomlik:
+• Ingestor Service(s):
+	• Feladata: Figyeli a külső API-kat (pl. Webhookokon keresztül fogadja az adatokat, vagy rövid időközönként pollrozza őket).
+	• Működése: A nyers külső adatot átalakítja egy egységes, belső Event DTO (Data Transfer Object) formátumra, majd bedobja a RabbitMQ event-rules exchange-be a megfelelő routing kulccsal.
+• Core Rule Engine Service:
+	• Feladata: Ez a szolgáltatás végzi az események és a felhasználói igények valós idejű párosítását.
+	• Működése: Beolvassa a beérkező eseményt. Lekéri az adatbázisból (vagy gyorsítótárból) azokat a felhasználókat, akik pontosan erre az eseménytípusra iratkoztak fel.
+	• Minden egyezésnél generál egy egyedi értesítési csomagot (User ID, Esemény adatai, Célcsatorna), és továbbküldi a RabbitMQ dispatch exchange-ébe.
+• Email Worker Service:
+	• Feladata: Kizárólag az emailek formázása és kiküldése.
+	• Működése: A saját sorából (email-delivery) fogyasztja az üzeneteket, ráhúzza az esemény adatait az Email HTML sablonra, és azonnal meghívja a külső szolgáltatót (pl. SendGrid, AWS SES).
+• Slack Worker Service:
+	• Feladata: Kizárólag a Slack üzenetek formázása és kiküldése.
+	• Működése: A slack-delivery sorból dolgozik. Az eseményt átformázza a Slack által elvárt JSON (Block Kit) formátumra, és a felhasználó Slack webhookjára vagy a Bot tokenjével a Slack API-ra lövi be az üzenetet.
+
+3. A Flexibilitás és Bővíthetőség kulcsa (Open-Closed Principle)
+
+Ahhoz, hogy később bármilyen új csatornát (pl. SMS, Push Notification) kódmódosítás nélkül vagy minimális munkával hozzá tudjunk adni, a következő mintát alkalmazzuk:
+1. Egységes Üzenet Interfész: A Core Rule Engine nem tudja, hogyan kell Slack üzenetet formázni. Ő csak egy ilyen objektumot küld szét:json
+{
+  "userId": "usr_123456",
+  "channel": "slack", 
+  "payload": {
+    "title": "Breaking News: Akvizíció",
+    "severity": "high",
+    "timestamp": 1711973600
+  }
+}
+Körültekintően használja a kódot.
+2. Plug-and-Play Csatornák: Ha jön egy új csatorna (pl. Telegram):
+	• Létrehozunk egy új RabbitMQ sorra kötött mikroszolgáltatást (telegram-worker).
+	• A RabbitMQ konfigurációban beállítjuk, hogy ha a channel == "telegram", akkor az üzenet ebbe a sorba kerüljön.
+	• A Core Service vagy a meglévő Worker-ek kódjához egyetlen sort sem kell hozzáérni.
+
+4. Adatbázis fókusz (Valós idejű szűréshez)
+
+Mivel a valós idő a cél, az adatbázis-lekéréseknek villámgyorsnak kell lenniük. A relációs modell (PostgreSQL) tökéletes, de indexelési stratégiával kell támogatni:
+• AlertConfigurations tábla: user_id, event_type (pl. 'market_movement'), channel ('email', 'slack'), criteria (pl. JSONB-ben a finomabb szűrések, mint küszöbértékek).
+• Optimalizáció: Komplex SQL JOIN-ok helyett az aktív alert szabályokat érdemes egy gyorsítótárban (pl. Redis-ben, eseménytípus szerint csoportosítva) tartani, hogy a Core Service O(1) vagy O(log n) idő alatt megtalálja, kinek kell üzenni.
+Mivel a valós idejű működés és a RabbitMQ topológia összeállt, hogyan lépjünk tovább?
+• Kidolgozzuk a belső üzenet-formátum (Event DTO) és a Slack/Email sablonok felépítését?
+• Megírjuk a Core Rule Engine pszeudokódját / interface tervét, ami bemutatja a szabályok lefutását?
+• Vagy átnézzük, hogyan kezeljük le a külső API-k hibáit (pl. ha a Slack API épp elérhetetlen vagy hibát dob)?
+
+
+
+------------------------------------------------------
+
+Fejtsd ki bővebben a RabbitMQ Topic Exchange működését, és a Core.Rule.Engine service-t
+
+-----
+
+Íme a rendszer két legfontosabb elemének – a RabbitMQ Topic Exchange-nek és a Core Rule Engine-nek – a részletes, mélyreható működése.
+
+1. RabbitMQ Topic Exchange mélyfúrás
+
+A Topic Exchange a kulcsa annak, hogy a külső API-kból beérkező, heterogén (sokféle) adatfolyamot intelligensen, valós időben és strukturáltan tudjuk szétválogatni.
+
+Hogyan működik a Routing Key (Útválasztási kulcs)?
+
+A Topic Exchange-nél a kibocsátott üzenetekhez egy pontokkal elválasztott szavakból álló struktúrát, úgynevezett Routing Key-t rendelünk. A mi esetünkben a struktúra így néz ki:
+[fő_kategória].[alkategória].[súlyosság]
+Példák a külső API-k által generált kulcsokra:
+• market.crypto.high (pl. A Bitcoin ára 10%-ot esett)
+• news.breaking.medium (pl. Rendkívüli bejelentés a kormánytól)
+• disaster.earthquake.critical (pl. 7-es erősségű földrengés egy lakott területen)
+
+Wildcard (Helyettesítő) karakterek a Queue Binding-nál
+
+Amikor a Core Rule Engine sorait (Queue) hozzákötjük (Binding) az Exchange-hez, nem kell minden egyes kulcsot külön megadnunk. Két speciális karaktert használhatunk:
+• * (csillag): Pontosan egy szót helyettesít.
+• # (kettőskereszt): Nulla vagy több szót helyettesít.
+
+Így néz ki a gyakorlatban:
+
+Ha a Core Rule Engine-t fel akarjuk készíteni a különböző eseménytípusok fogadására, a következőképpen kötjük be a sorait az Exchange-hez:
+
+Binding Pattern (Minta)	Milyen üzeneteket fogad be?	Példa
+news.#	Minden hírt, függetlenül az alkategóriától vagy súlyosságtól.	news.breaking.high, news.politics.low
+*.crypto.*	Minden kriptopiaci mozgást, a súlyosságtól függetlenül.	market.crypto.high, feed.crypto.low
+#	Minden létező eseményt a rendszerben.	Bármit, ami befut.
+
+Miért ezt használjuk? Mert ha holnap bevezetünk egy új alkategóriát (pl. market.forex.high), a RabbitMQ automatikusan átirányítja a market.# mintára hallgató sorokba anélkül, hogy a konfigurációt újra kellene írni.
+
+2. A Core Rule Engine Service működése
+
+A Core Rule Engine egy állapotmentes (stateless), rendkívül gyors mikroszolgáltatás. Nem végez nehéz I/O műveleteket (nem küld emailt, nem formáz HTML-t), az egyetlen feladata a párosítás és a döntéshozatal.
+
+A belső működési folyamat (Step-by-Step):
+
+1. Üzenet elfogyasztása (Consume): A szolgáltatás folyamatosan hallgatja a RabbitMQ-ból érkező eseményeket. Befut egy üzenet, például:
+	• Routing Key: market.crypto.high
+	• Payload: { "asset": "BTC", "change_percent": 6.2, "current_price": 68200 }
+2. Felhasználói szabályok lekérése (Rule Matching): A rendszernek meg kell keresnie, hogy ki iratkozott fel erre.
+	• Valós idejű optimalizáció: Nem futunk ki a lassú SQL adatbázisba minden egyes üzenetnél. A szabályokat egy Redis (In-Memory) adatbázisban tároljuk. A Redis-ből egy SMEMBERS rules:market.crypto paranccsal mikroszekundumok alatt lekérjük az aktív előfizetők listáját.
+3. Kritériumok ellenőrzése (Filtering): Tegyük fel, hogy két felhasználót találtunk:
+	• User A: "Kérek riasztást, ha a BTC változik több mint 5%-ot." -> MATCH (6.2% > 5%)
+	• User B: "Kérek riasztást, ha a BTC változik több mint 10%-ot." -> NO MATCH (6.2% < 10%)
+4. Kézbesítési parancs generálása (Dispatch): User A-nak küldeni kell egy értesítést. Az adatbázis szerint User A a Slack és az Email csatornát is bejelölte. A Core Engine létrehoz két különálló kézbesítési feladatot (Dispatch DTO):
+json
+// Első feladat a Slack sorba
+{
+  "userId": "usr_9988",
+  "channel": "slack",
+  "event_type": "market.crypto",
+  "raw_data": { "asset": "BTC", "change_percent": 6.2 }
+}
+
+// Második feladat az Email sorba
+{
+  "userId": "usr_9988",
+  "channel": "email",
+  "event_type": "market.crypto",
+  "raw_data": { "asset": "BTC", "change_percent": 6.2 }
+}
+Körültekintően használja a kódot.
+5. Továbbítás a Workers felé: A Core Engine belezavarja ezt a két üzenetet a következő RabbitMQ Exchange-be (dispatch). Ezzel a munkája véget ért, azonnal lép a következő beérkező hírre. A feladatot a háttérben a specifikus Email és Slack Worker-ek fogják befejezni.
+
+A Core Rule Engine Pszeudokódja (Interface terv)
+
+Hogy látszódjon a kód szintű letisztultság, a Core Engine központi logikája valahogy így festene (TypeScript/Node.js példa):
+typescript
+interface IncomingEvent {
+  routingKey: string;
+  payload: any;
+}
+
+interface UserAlertRule {
+  userId: string;
+  channel: 'email' | 'slack';
+  condition: (payload: any) => boolean;
+}
+
+class CoreRuleEngine {
+  constructor(
+    private cacheProvider: CacheRepository, // Redis
+    private rabbitMQProvider: MessageBroker  // RabbitMQ Client
+  ) {}
+
+  // Ez a függvény fut le minden egyes bejövő RabbitMQ üzenetnél
+  async handleIncomingEvent(event: IncomingEvent): Promise<void> {
+    // 1. Lekérjük a szabályokat a gyorsítótárból a routingKey alapján
+    const activeRules: UserAlertRule[] = await this.cacheProvider.getRulesForTopic(event.routingKey);
+
+    // 2. Végigmegyünk a szabályokon és ellenőrizzük a feltételeket
+    for (const rule of activeRules) {
+      if (rule.condition(event.payload)) {
+        
+        // 3. Ha a feltétel teljesül, összeállítjuk a dispatch üzenetet
+        const dispatchMessage = {
+          userId: rule.userId,
+          channel: rule.channel,
+          metadata: {
+            topic: event.routingKey,
+            timestamp: Date.now()
+          },
+          data: event.payload
+        };
+
+        // 4. Kiküldjük a megfelelő worker sorába (pl. 'dispatch.slack' vagy 'dispatch.email')
+        const targetRoutingKey = `dispatch.${rule.channel}`;
+        await this.rabbitMQProvider.publish('dispatch-exchange', targetRoutingKey, dispatchMessage);
+      }
+    }
+  }
+}
+Körültekintően használja a kódot.
+
+Összegzés: Miért tökéletes ez a felállás a briefhez?
+
+Ha holnap a menedzsment kitalálja, hogy a Discord csatornát is támogatni kell:
+1. A felhasználó beállításainál a rule.channel értéke lehet discord.
+2. A Core Rule Engine a fenti kód alapján automatikusan a dispatch.discord kulccsal fogja kiküldeni az üzenetet.
+3. Nekünk csak egy teljesen új, különálló DiscordWorker projektet kell megírnunk, ami erre a sorra iratkozik fel. A Core Rule Engine-hez hozzá sem kell nyúlnunk, így teljesül a rugalmasság követelménye.

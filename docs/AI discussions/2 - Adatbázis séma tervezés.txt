@@ -1,0 +1,351 @@
+ADATBÁZIS STRUKTÚRA TERVEZÉS
+----------------------------
+
+Tervezzük meg hozzá az adatbázis struktúrát
+
+-----
+
+Ahhoz, hogy a rendszer valós időben működjön, de közben könnyen bővíthető legyen új értesítési csatornákkal (Slack, Email, SMS stb.) és finomhangolható szabályokkal, a relációs adatbázis (pl. PostgreSQL) a legjobb választás. A PostgreSQL JSONB típusa tökéletes egyensúlyt biztosít a strukturált adatok és a rugalmas, csatornaspecifikus beállítások között.
+Íme a rendszer adatbázis-struktúrája (Entity-Relationship modell) DDL (SQL) formátumban, magyarázatokkal.
+
+1. Az Adatbázis Séma (DDL)
+
+sql
+-- 1. FELHASZNÁLÓK ÉS MUNKAHELYEK
+CREATE TABLE users (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    email VARCHAR(255) UNIQUE NOT NULL,
+    first_name VARCHAR(100),
+    last_name VARCHAR(100),
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+);
+
+-- Slack vagy egyéb jövőbeli 3rd party integrációk tárolása
+CREATE TABLE user_integrations (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    provider VARCHAR(50) NOT NULL, -- 'slack', 'discord', 'telegram'
+    
+    -- Titkosított tokenek, webhook URL-ek, workspace ID-k rugalmas tárolása
+    credentials JSONB NOT NULL, 
+    
+    is_active BOOLEAN DEFAULT TRUE,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+    
+    CONSTRAINT unique_user_provider UNIQUE (user_id, provider)
+);
+
+-- 2. ALERT SZABÁLYOK ÉS BEÁLLÍTÁSOK
+CREATE TABLE alert_rules (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    name VARCHAR(150) NOT NULL, -- pl. "BTC Árfigyelő 5% felett"
+    
+    -- Erre iratkozik fel (Ez egyezik a RabbitMQ routing key elejével)
+    -- pl.: 'market.crypto', 'news.breaking', 'disaster.earthquake'
+    topic_pattern VARCHAR(100) NOT NULL, 
+    
+    -- A specifikus szűrési feltételek (pl. threshold: 5, asset: "BTC")
+    -- Így nem kell minden új feltételhez új oszlopot vagy táblát létrehozni
+    conditions JSONB DEFAULT '{}'::jsonb, 
+    
+    is_enabled BOOLEAN DEFAULT TRUE,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+);
+
+-- Egy szabályhoz több csatorna is tartozhat (pl. Ugyanaz a riasztás menjen Emailre ÉS Slackre is)
+CREATE TABLE alert_channels (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    alert_rule_id UUID NOT NULL REFERENCES alert_rules(id) ON DELETE CASCADE,
+    
+    -- 'email', 'slack', 'sms', 'push'
+    channel_type VARCHAR(50) NOT NULL, 
+    
+    -- Csatorna-specifikus beállítások (pl. emailnél a másodlagos email cím, 
+    -- slacknél a konkrét #channel neve, ahova küldeni kell)
+    channel_config JSONB DEFAULT '{}'::jsonb, 
+    
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+    
+    CONSTRAINT unique_rule_channel UNIQUE (alert_rule_id, channel_type)
+);
+
+-- 3. TELJESÍTMÉNY-OPTIMALIZÁLÓ INDEXEK
+CREATE INDEX idx_alert_rules_topic ON alert_rules(topic_pattern) WHERE is_enabled = TRUE;
+CREATE INDEX idx_user_integrations_provider ON user_integrations(user_id, provider) WHERE is_active = TRUE;
+Körültekintően használja a kódot.
+
+2. A kulcsfontosságú mezők mélyebb magyarázata
+
+
+A alert_rules.conditions (JSONB) mező ereje
+
+Ha egy felhasználó azt kéri, hogy "csak akkor értesíts, ha a BTC mozgása nagyobb, mint 5%", akkor ezt nem fix SQL oszlopokban tároljuk. A JSONB mező tartalma ez lesz:
+json
+{
+  "asset": "BTC",
+  "operator": "GREATER_THAN",
+  "value": 5.0
+}
+Körültekintően használja a kódot.
+Ha később a termékmenedzser kitalálja, hogy a természeti katasztrófáknál lehessen Richter-skála erősség vagy város név alapján szűrni, az adatbázis sémához hozzá sem kell nyúlni, a Core Rule Engine JSON-alapú kiértékelője (pl. egy JSON-schema validator vagy json-rules-engine könyvtár) fel fogja dolgozni.
+
+A alert_channels.channel_config (JSONB) szerepe
+
+Minden értesítési csatornának más adatra van szüksége az eléréshez.
+• Slack esetén: { "target_channel": "#crypto-alerts" } (A token a user_integrations-ből jön).
+• Email esetén: { "alternative_email": "work@company.com" } (Ha nem az elsődleges regisztrált emailre kéri).
+• SMS esetén (jövőben): { "phone_number": "+36301234567" }.
+
+3. Hogyan működik a lekérdezés a Core Rule Engine-ben?
+
+Amikor befut egy esemény (pl. market.crypto.high, a payloadban pedig BTC és 6.2% adatokkal), a Core Rule Engine-nek villámgyorsan meg kell találnia a címzetteket.
+Bár említettük, hogy a termelésben ezt a listát Redis-ből fogjuk felolvasni a maximális sebességért, a Redis-t az adatbázisból kell feltöltenünk (és szinkronban tartanunk). Az SQL lekérdezés, ami kikeresi a releváns szabályokat és csatornákat, így néz ki:
+sql
+SELECT 
+    ar.id AS rule_id,
+    ar.user_id,
+    ar.conditions,
+    ac.channel_type,
+    ac.channel_config,
+    ui.credentials AS integration_credentials
+FROM alert_rules ar
+JOIN alert_channels ac ON ar.id = ac.alert_rule_id
+LEFT JOIN user_integrations ui ON ar.user_id = ui.user_id AND ac.channel_type = ui.provider
+WHERE ar.topic_pattern = 'market.crypto' -- A bejövő esemény fő témája
+  AND ar.is_enabled = TRUE;
+Körültekintően használja a kódot.
+
+4. Skálázhatósági és Karbantartási szempontok
+
+1. Adatbázis-szintű kényszerek (Constraints): A unique_rule_channel biztosítja, hogy egy adott alert szabályhoz ne lehessen kétszer hozzáadni az email csatornát. Ezzel elkerüljük az olyan hibákat, hogy a felhasználó duplán kapja meg ugyanazt a levelet.
+2. Laza kapcsolat (Loose Coupling): A user_integrations tábla teljesen leválasztja az OAuth/külső bejelentkezési és hozzáférési adatokat a riasztási logikáról. Ha a felhasználó újrahitelesíti a Slacket, az alert_rules táblához nem kell nyúlni.
+Az adatbázisstruktúra lefedi az összes üzleti igényt. Hogyan folytassuk a rendszer kidolgozását?
+• Nézzük meg, hogyan épül fel a Redis gyorsítótár struktúrája, hogy az SQL-t tehermentesítsük?
+• Készítsünk egy szekvenciadiagramot (Sequence Diagram), ami bemutatja az adat útját a külső API-tól a Slack webhookig?
+• Vagy térjünk át a Slack Worker technikai részleteire (OAuth folyamat, tokenek tárolása, Block Kit üzenetküldés)?
+
+
+
+------------------------------------------------------
+
+MS SQL adatbázist használunk, módosítsd ez alapján a tervet
+
+-----
+
+Mivel a célrendszer MS SQL (Microsoft SQL Server), a PostgreSQL-specifikus elemeket (mint a gen_random_uuid() vagy a JSONB típus) át kell ültetnünk az MS SQL natív megoldásaira.
+Az MS SQL-ben a rugalmas JSON adatok tárolására az NVARCHAR(MAX) típust használjuk, amelyet beépített JSON függvényekkel (ISJSON, JSON_VALUE, JSON_QUERY) tudunk natívan és rendkívül gyorsan lekérdezni, valamint indexelni.
+Íme a módosított MS SQL adatbázis-struktúra és a hozzá tartozó optimalizációk.
+
+1. MS SQL Adatbázis Séma (DDL)
+
+sql
+-- 1. FELHASZNÁLÓK ÉS MUNKAHELYEK
+CREATE TABLE users (
+    id UNIQUEIDENTIFIER PRIMARY KEY DEFAULT NEWID(),
+    email NVARCHAR(255) NOT NULL UNIQUE,
+    first_name NVARCHAR(100) NULL,
+    last_name NVARCHAR(100) NULL,
+    created_at DATETIMEOFFSET DEFAULT SYSDATETIMEOFFSET(),
+    updated_at DATETIMEOFFSET DEFAULT SYSDATETIMEOFFSET()
+);
+
+-- Slack vagy egyéb jövőbeli 3rd party integrációk tárolása
+CREATE TABLE user_integrations (
+    id UNIQUEIDENTIFIER PRIMARY KEY DEFAULT NEWID(),
+    user_id UNIQUEIDENTIFIER NOT NULL FOREIGN KEY REFERENCES users(id) ON DELETE CASCADE,
+    provider NVARCHAR(50) NOT NULL, -- 'slack', 'discord', 'telegram'
+    
+    -- Rugalmas JSON tárolás NVARCHAR(MAX) típussal, kényszerítve, hogy csak valid JSON lehessen
+    credentials NVARCHAR(MAX) NOT NULL, 
+    
+    is_active BIT DEFAULT 1,
+    created_at DATETIMEOFFSET DEFAULT SYSDATETIMEOFFSET(),
+    updated_at DATETIMEOFFSET DEFAULT SYSDATETIMEOFFSET(),
+    
+    CONSTRAINT chk_user_integrations_json CHECK (ISJSON(credentials) > 0),
+    CONSTRAINT unique_user_provider UNIQUE (user_id, provider)
+);
+
+-- 2. ALERT SZABÁLYOK ÉS BEÁLLÍTÁSOK
+CREATE TABLE alert_rules (
+    id UNIQUEIDENTIFIER PRIMARY KEY DEFAULT NEWID(),
+    user_id UNIQUEIDENTIFIER NOT NULL FOREIGN KEY REFERENCES users(id) ON DELETE CASCADE,
+    name NVARCHAR(150) NOT NULL, -- pl. "BTC Árfigyelő 5% felett"
+    
+    -- Erre iratkozik fel (Ez egyezik a RabbitMQ routing key elejével)
+    topic_pattern NVARCHAR(100) NOT NULL, 
+    
+    -- A specifikus szűrési feltételek JSON formátumban
+    conditions NVARCHAR(MAX) NOT NULL DEFAULT '{}', 
+    
+    is_enabled BIT DEFAULT 1,
+    created_at DATETIMEOFFSET DEFAULT SYSDATETIMEOFFSET(),
+    updated_at DATETIMEOFFSET DEFAULT SYSDATETIMEOFFSET(),
+    
+    CONSTRAINT chk_alert_rules_json CHECK (ISJSON(conditions) > 0)
+);
+
+-- Egy szabályhoz több csatorna is tartozhat (pl. Email és Slack egyszerre)
+CREATE TABLE alert_channels (
+    id UNIQUEIDENTIFIER PRIMARY KEY DEFAULT NEWID(),
+    alert_rule_id UNIQUEIDENTIFIER NOT NULL FOREIGN KEY REFERENCES alert_rules(id) ON DELETE CASCADE,
+    
+    channel_type NVARCHAR(50) NOT NULL, -- 'email', 'slack', 'sms'
+    
+    -- Csatorna-specifikus beállítások JSON formátumban
+    channel_config NVARCHAR(MAX) NOT NULL DEFAULT '{}', 
+    
+    created_at DATETIMEOFFSET DEFAULT SYSDATETIMEOFFSET(),
+    
+    CONSTRAINT chk_alert_channels_json CHECK (ISJSON(channel_config) > 0),
+    CONSTRAINT unique_rule_channel UNIQUE (alert_rule_id, channel_type)
+);
+
+-- 3. TELJESÍTMÉNY-OPTIMALIZÁLÓ INDEXEK
+-- MS SQL szűrt indexek (Filtered Indexes) az aktív szabályok gyors eléréséhez
+CREATE NONCLUSTERED INDEX idx_alert_rules_topic 
+ON alert_rules(topic_pattern) 
+WHERE is_enabled = 1;
+
+CREATE NONCLUSTERED INDEX idx_user_integrations_provider 
+ON user_integrations(user_id, provider) 
+WHERE is_active = 1;
+Körültekintően használja a kódot.
+
+2. Mi változott az MS SQL miatt?
+
+• UNIQUEIDENTIFIER & NEWID(): A PostgreSQL UUID típusa helyett az MS SQL natív 128 bites egyedi azonosítóját használjuk.
+• DATETIMEOFFSET & SYSDATETIMEOFFSET(): A TIMESTAMP WITH TIME ZONE helyett ez a legpontosabb időtípus MS SQL-ben, ami megőrzi az időzóna eltolódást is, megelőzve a real-time rendszereknél kritikus időzóna-csúszásokat.
+• NVARCHAR(MAX) + ISJSON(): Az MS SQL-ben nincs különálló JSON adattípus. Helyette Unicode szövegként tároljuk az adatot, de a CHECK (ISJSON(...)) kényszer garantálja, hogy az alkalmazás ne tudjon hibás vagy sérült JSON struktúrát menteni az adatbázisba.
+• BIT típus: A BOOLEAN helyett az MS SQL a BIT (0 vagy 1) típust használja a logikai értékekre.
+
+3. Valós idejű szűrés MS SQL JSON függvényekkel
+
+Ha a Core Rule Engine mégis közvetlenül az MS SQL-ből szeretne szűrni (vagy a Redis-t akarjuk feltölteni), az MS SQL JSON_VALUE függvényével közvetlenül a JSON sztringek belsejébe tudunk nyúlni anélkül, hogy az egész objektumot le kellene kérnünk és az alkalmazáskódban parse-olnánk.
+Példa lekérdezés: Keressük meg azokat az aktív szabályokat, ahol a bejövő eszköz ("asset") a BTC:
+sql
+SELECT 
+    ar.id AS rule_id,
+    ar.user_id,
+    ac.channel_type,
+    -- Így olvassuk ki a JSON tulajdonságot MS SQL-ben:
+    JSON_VALUE(ar.conditions, '$.asset') AS target_asset,
+    JSON_VALUE(ar.conditions, '$.value') AS threshold_value
+FROM alert_rules ar
+JOIN alert_channels ac ON ar.id = ac.alert_rule_id
+WHERE ar.topic_pattern = 'market.crypto'
+  AND ar.is_enabled = 1
+  -- Csak azokat a szabályokat kérjük, amik BTC-re vonatkoznak
+  AND JSON_VALUE(ar.conditions, '$.asset') = 'BTC';
+Körültekintően használja a kódot.
+
+4. Haladó MS SQL optimalizáció (Computed Column)
+
+Ha a terhelés később mégis növekedne, és a JSON alapú szűrést gyorsítani kellene a Redis előtt, az MS SQL-ben létrehozhatunk egy számított oszlopot (Computed Column) a JSON egyik mezőjére (pl. az asset-re), és arra tehetünk egy hagyományos B-fa indexet. Ezáltal a JSON szűrés ugyanolyan gyors lesz, mintha egy dedikált táblaoszlop lenne.
+Mivel az MS SQL séma elkészült, hogyan lépjünk tovább?
+• Nézzük meg, hogyan épül fel a szekvenciadiagram, amely bemutatja az adat útját az MS SQL, RabbitMQ és a Worker-ek között?
+• Dolgozzuk ki a Slack Worker technikai megvalósítását (hogyan küldjük el az MS SQL-ből kiolvasott adatokat a Slack Block Kit formátumában)?
+• Vagy nézzük meg a Core Rule Engine pontos MS SQL / Redis szinkronizációs logikáját?
+
+
+
+------------------------------------------------------
+
+PostgreSQL jobb választás lenne a json mezők miatt?
+Gyorsabban dolgozna/szűrne mint az MS SQL?
+
+-----
+
+Igen, a .NET Core (C#) és az Entity Framework Core (EF Core) zseniálisan jó párost alkot a PostgreSQL-lel és a JSONB mezőkkel.
+Valójában a .NET ökoszisztémában a PostgreSQL hivatalos drivere (Npgsql) és annak EF Core kiterjesztése az egyik legfejlettebb a piacon. Nemcsak hogy kezelni tudja, de a C# erősen típusos objektumait automatikusan lefordítja PostgreSQL JSONB formátumra, és a LINQ lekérdezéseket is natív adatbázis-oldali JSON-szűréssé alakítja.
+Íme, hogyan működik ez a gyakorlatban, és hogyan fog kinézni a kódod.
+
+1. Hogyan kezeli az EF Core a PostgreSQL JSONB-t?
+
+Nem kell string-ként vagy manuális JSON parse-olással szenvedned. A C#-ban létrehozhatsz rendes osztályokat (POCO) a szűrési feltételeknek és a csatorna-konfigurációknak, az EF Core pedig elvégzi a piszkos munkát.
+
+A C# Entity modellek:
+
+csharp
+using System.ComponentModel.DataAnnotations.Schema;
+
+public class AlertRule
+{
+    public Guid Id { get; set; } = Guid.NewGuid();
+    public Guid UserId { get; set; }
+    public string Name { get; set; } = string.Empty;
+    public string TopicPattern { get; set; } = string.Empty;
+    public bool IsEnabled { get; set; } = true;
+
+    // Ez lesz a JSONB mező az adatbázisban!
+    [Column(TypeName = "jsonb")]
+    public AlertConditions Conditions { get; set; } = new();
+}
+
+// Erősen típusos osztály a rugalmas feltételeknek
+public class AlertConditions
+{
+    public string Asset { get; set; } = string.Empty;
+    public string Operator { get; set; } = string.Empty;
+    public decimal Value { get; set; }
+}
+Körültekintően használja a kódot.
+
+A DbContext konfiguráció (Fluent API):
+
+Az AppDbContext-ben megmondhatod az EF Core-nak, hogy hozzon létre GIN indexet a JSONB mezőre a maximális szűrési sebességért:
+csharp
+protected override void OnModelCreating(ModelBuilder modelBuilder)
+{
+    modelBuilder.Entity<AlertRule>()
+        .HasIndex(b => b.Conditions)
+        .HasMethod("gin"); // Natív PostgreSQL GIN index létrehozása!
+}
+Körültekintően használja a kódot.
+
+2. Valós idejű LINQ lekérdezés (A varázslat)
+
+Amikor a Core Rule Engine-ben bejön egy esemény (pl. BTC mozgás), egy teljesen normális LINQ lekérdezést írhatsz. Az EF Core nem fogja letölteni az összes sort a memóriába, hanem a JSON belsejében futó SQL-lé fordítja le a C# kódot.
+
+C# LINQ kód:
+
+csharp
+var incomingAsset = "BTC";
+var incomingChange = 6.2m;
+
+var matchingRules = await _context.AlertRules
+    .Where(r => r.TopicPattern == "market.crypto" && r.IsEnabled)
+    // Az EF Core belelát a JSON objektumba!
+    .Where(r => r.Conditions.Asset == incomingAsset && r.Conditions.Value <= incomingChange)
+    .ToListAsync();
+Körültekintően használja a kódot.
+
+Amit az EF Core a háttérben generál és kiküld a Postgres-nek:
+
+sql
+SELECT a.id, a.user_id, a.name, a.topic_pattern, a.is_enabled, a.conditions
+FROM alert_rules AS a
+WHERE a.topic_pattern = 'market.crypto' 
+  AND a.is_enabled = TRUE
+  AND (a.conditions ->> 'Asset') = 'BTC' 
+  AND CAST(a.conditions ->> 'Value' AS numeric) <= 6.2;
+Körültekintően használja a kódot.
+Megjegyzés: A GIN indexnek köszönhetően ez a lekérdezés villámgyors lesz, nem terheli a CPU-t.
+
+3. Miért jobb ez .NET-ben, mint az MS SQL kombináció?
+
+Ha MS SQL-t használnál EF Core-ral, a JSON mezők kezelése sokkal nehézkesebb lenne:
+1. Az MS SQL EF Core providere nem támogatja ilyen transzparensen a komplex C# objektumok JSON-ná alakítását a háttérben (gyakran HasConversion(v => JsonConvert.SerializeObject(v), ...) trükközések kellenek).
+2. Az MS SQL-nél a LINQ nem tudna automatikusan optimális indexelt JSON-lekérdezést generálni, mert nincsenek általános GIN indexek.
+
+Konklúzió
+
+A .NET Core + EF Core + PostgreSQL (JSONB) az egyik legjobb iparági standard architektúra egy ilyen jellegű, rugalmas, eseményvezérelt riasztási rendszerhez. Teljes típusbiztonságot kapsz a C# oldalon, miközben megmarad a dokumentum-adatbázisok rugalmassága és a relációs adatbázisok ACID megbízhatósága.
+Mivel a technológiai stack összeállt (.NET Core, EF Core, PostgreSQL, RabbitMQ), merre menjünk tovább?
+• Nézzük meg a RabbitMQ .NET-es integrációját (hogyan érdemes a BackgroundService vagy IHostedService segítségével fogyasztani az üzeneteket)?
+• Dolgozzuk ki a szabálykiértékelő (Core Rule Engine) C# osztályának pontos struktúráját?
+• Vagy beszéljünk arról, hogyan kezeljük a Slack OAuth tokeneket biztonságosan ebben a stackben (pl. titkosítás adatbázis szinten)?

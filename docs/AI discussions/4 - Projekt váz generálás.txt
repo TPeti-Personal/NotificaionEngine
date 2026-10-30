@@ -1,0 +1,81 @@
+PROJEKT VÁZ GENRÁLÁSA
+---------------------
+
+tudnál generálni nekem ebből egy letölthető projektet?
+.net Core, C#, microservice architectúra - core, infrastructure, application rétegekkel.
+A következő NuGet-ekkel telepítve:
+ - EF Core + PostgreSQL
+ - RabbitMQ
+ - logoláshoz az alap Microsoft.Extensions.Logging
+
+Bele kellene rakni a DB Context-et is, a megbeszélt Alert és User dto-kkal
+Valamint bele kellene rakni a megbeszélt Core.Notification.Rule service-t is
+
+-----
+
+Here is your file: NotificationEngine-Template zip
+Összeállítottam és becsomagoltam neked a kért, szigorúan strukturált Clean Architecture mikroszolgáltatás sablont a megbeszélt paraméterek alapján.
+Loggolásra a nagy teljesítményű .NET-es Microsoft.Extensions.Logging absztrakciót implementáltam.
+
+A generált struktúra és a beépített elemek:
+
+1. NotificationEngine.Core (Domain réteg)
+	• Tartalmazza a teljes és végleges entitásmodellt: User, UserIntegration, AlertRule, AlertConditions, és AlertChannel osztályokat.
+	• Az AlertConditions egy erősen típusos belső osztályként van definiálva az eszköz (Asset), az operátor (Operator) és a küszöbérték (Value) kezelésére.
+2. NotificationEngine.Application (Absztrakciós réteg)
+	• Definiálja az IAlertRuleMatcherRepository interfészt és a laposított, rekordalapú MatchedRuleResult DTO szerkezetet, amely biztosítja, hogy a Core Engine és az adatbázis között az adatáramlás laza kapcsolatban (decoupling) maradjon.
+3. NotificationEngine.Infrastructure (Perzisztencia réteg)
+	• AppDbContext: Tartalmazza a teljes EF Core leképezést. Az OnModelCreating metódusban konfigurálva van a .NET 8 natív .ToJson() tulajdonsága, amely a PostgreSQL felé az AlertConditions objektumot automatikusan strukturált, indexelhető JSON formátumban menti el, valamint elhelyezi a szükséges összetett indexeket a TopicPattern és IsEnabled mezőkön.
+	• PostgresAlertRuleMatcherRepository: A konkrét LINQ implementáció, amely az aszinkron adatbázis-lekérdezés során a szűrést transzparensen a PostgreSQL JSONB motorjára bízza.
+4. Core.Notification.Rule.Service (Futtatható mikroszolgáltatás)
+	• Program.cs: Beállítja az alapértelmezett Microsoft-konzolos naplózót (builder.Logging.AddConsole()), regisztrálja a PostgreSQL DbContext-et a kapcsolati sztringgel, és Singletonként bejegyzi a perzisztens RabbitMQ IConnection kapcsolatot.
+	• CoreRuleEngineWorker: Egy aszinkron .NET BackgroundService. Induláskor automatikusan deklarálja a RabbitMQ topológiát (event-exchange Topic, dispatch-exchange Direct, valamint a core-rules-queue felolvasó sort a megfelelő market.# és news.# kötésekkel). Az üzenetek érkezésekor az eseményeket a gyári ILogger<CoreRuleEngineWorker> injektált interfészen keresztül naplózza konzolra.
+
+Alkalmazott stabil NuGet csomagok:
+
+• Infrastructure: Microsoft.EntityFrameworkCore (8.0.8), Npgsql.EntityFrameworkCore.PostgreSQL (8.0.4)
+• Rule Service: RabbitMQ.Client (6.8.1)
+A csomag kicsomagolása után a solution fájl azonnal indítható Visual Studio vagy JetBrains Rider környezetben. A helyi teszteléshez az appsettings.json fájlban találod a PostgreSQL és RabbitMQ alapértelmezett kapcsolódási paramétereit.
+Most, hogy a teljes Microsoft-alapú Clean Architecture vázad készen áll az entitásokkal és a DbContext-tel, hogyan haladjunk tovább?
+• Generáljunk egy Docker Compose fájlt, amivel egyetlen parancssori utasítással elindíthatod helyben a PostgreSQL és a RabbitMQ konténereket a teszteléshez?
+• Kidolgozzuk a rendszer hiba- és tranzakciókezelési logikáját (pl. mi történik, ha megszakad a kapcsolat a Postgres-szel feldolgozás közben)?
+• Vagy elkezdjük megírni az üzeneteket fogadó Ingestion API (.NET Web API) mikroszolgáltatás vázát?
+
+
+
+------------------------------------------------------
+
+Légyszíves a core és infrastructure részeket bonts szét jobban, külön dto-kra, és context-re, ne minden 1 fájlban legyen.
+A rule service-ben is bontsd külön a worker-t.
+
+-----
+
+Here is your file: NotificationEngine-Template zip
+Módosítottam és teljesen szétbontottam a projekt struktúráját. Most már minden egyes entitás, DTO, interfész, DB kontextus és a worker is különálló, dedikált fizikai .cs fájlba került, megszüntetve az ömlesztett fájlstruktúrát.
+A ZIP csomag kicsomagolása után a következő, szigorúan strukturált felépítést fogod látni:
+
+A finomított projektstruktúra:
+
+• NotificationEngine.Core (Domain réteg)
+	• Models/User.cs – A felhasználó törzsadatai.
+	• Models/UserIntegration.cs – Harmadik fél integrációk (pl. Slack tokenek) tárolója.
+	• Models/AlertRule.cs – A riasztási szabályok magja.
+	• Models/AlertConditions.cs – Erősen típusos osztály a JSON feltételeknek (Asset, Operator, Value).
+	• Models/AlertChannel.cs – Szabályonkénti kézbesítési csatornák.
+• NotificationEngine.Application (Üzleti absztrakció és DTO-k)
+	• Interfaces/IAlertRuleMatcherRepository.cs – A lazán kapcsolt adatelérési felület.
+	• DTOs/MatchedRuleResult.cs – Az adatbázisból összevontan kiolvasott találati rekord.
+	• DTOs/IncomingEventDto.cs – A RabbitMQ-ból beérkező külső esemény DTO-ja.
+	• DTOs/DispatchMessageDto.cs – A Worker-ek felé továbbküldött egységes feladatobjektum.
+• NotificationEngine.Infrastructure (Perzisztencia)
+	• Persistence/AppDbContext.cs – Az EF Core kontextus, amely a .NET 8 .ToJson() segítségével kezeli a PostgreSQL JSONB mezőit.
+	• Repositories/PostgresAlertRuleMatcherRepository.cs – A konkrét, adatbázis-oldali LINQ-t futtató implementáció.
+• Core.Notification.Rule.Service (A mikroszolgáltatás)
+	• CoreRuleEngineWorker.cs – Tisztán csak a RabbitMQ fogyasztásért és topológiáért felelős BackgroundService.
+	• Program.cs – A mikroszolgáltatás belépési pontja a natív Microsoft-konzolos naplózással és DI konfigurációkkal.
+	• appsettings.json – A lokális PostgreSQL és RabbitMQ elérések konfigurációja.
+A NuGet csomagok (Npgsql.EntityFrameworkCore.PostgreSQL, RabbitMQ.Client, és a Microsoft Logging) a megfelelő projektekbe lettek szétosztva függőségek szerint. A solution azonnal megnyitható, fordítható és tesztelhető.
+Most, hogy a fájlok tisztán el vannak különítve, hogyan folytassuk a rendszer fejlesztését?
+• Készítsünk egy Docker Compose fájlt, amivel egyetlen paranccsal elindíthatod a teszteléshez szükséges PostgreSQL és RabbitMQ konténereket?
+• Bevezessük a Dead Letter Exchange (DLX) mintát a workerbe, hogy ha egy üzenet deszerializációja hibás (pl. rossz JSON formátum), ne akassza meg a fogyasztást?
+• Vagy elkezdjük kidolgozni a Slack Worker Service alapjait, ami fogadja a Core Engine által küldött üzeneteket?

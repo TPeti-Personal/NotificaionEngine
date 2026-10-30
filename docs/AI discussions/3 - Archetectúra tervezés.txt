@@ -1,0 +1,363 @@
+ARCHITEKTÚRA TERVEZÉS
+---------------------
+
+Generáld le a részletes architektúra-tervet.
+A Backend .Net Core C#, EF Core-al, PostgreSQL adatbázissal
+A Core.Rule.Service egyenlőre közvetlenül a DB repository-val dolgozzon, de tedd be a tervbe gyorsítótárazás (redis) későbbi bekötésének lehetőségét is.
+
+-----
+
+A megadott technológiai stack (.NET Core, EF Core, PostgreSQL, RabbitMQ) és a peremfeltételek alapján az alábbiakban található a részletes, produkciós szintű Rendszerarchitektúra és Megvalósítási Terv.
+A terv úgy lett kialakítva, hogy a Core Rule Engine egyelőre közvetlenül az EF Core Repository-n keresztül éri el a PostgreSQL-t, de az architektúra absztrakciós rétegei lehetővé teszik a Redis későbbi, kódmódosítás nélküli bevezetését.
+
+1. Rendszerarchitektúra Áttekintés
+
+A rendszer egy laza kapcsolatú (loosely coupled), eseményvezérelt mikroszolgáltatás-architektúrát követ.
+[ Külső Hír / Piac API-k ]
+           │
+           ▼ (HTTP Post / Webhook)
+┌─────────────────────────────────┐
+│        Ingestion Service        │
+└─────────────────────────────────┘
+           │
+           ▼ (Publish: event-exchange)
+┌─────────────────────────────────┐
+│      RabbitMQ Message Broker    │
+└─────────────────────────────────┘
+           │
+           ▼ (Consume: core-rules-queue)
+┌─────────────────────────────────┐
+│    Core Rule Engine Service     │
+└─────────────────────────────────┘
+           │
+           ├─► [IRepository / Cache Strategy] ─► [PostgreSQL DB] (Később: Redis)
+           │
+           ▼ (Publish: dispatch-exchange)
+┌─────────────────────────────────┐
+│      RabbitMQ Message Broker    │
+└─────────────────────────────────┘
+           │
+      ┌────┴────────────────────────┐
+      ▼ (Consume: email-queue)      ▼ (Consume: slack-queue)
+┌───────────────────────────┐ ┌───────────────────────────┐
+│    Email Worker Service   │ │    Slack Worker Service   │
+└───────────────────────────┘ └───────────────────────────┘
+           │                             │
+           ▼ (SMTP/API)                  ▼ (HTTPS)
+      [ SendGrid / SES ]            [ Slack API ]
+
+2. Adatbázis Réteg (PostgreSQL + EF Core)
+
+
+C# Domain Modellek és Rugalmas JSONB feltételek
+
+csharp
+using System.ComponentModel.DataAnnotations.Schema;
+
+public class User
+{
+    public Guid Id { get; set; } = Guid.NewGuid();
+    public string Email { get; set; } = string.Empty;
+    public string? FirstName { get; set; }
+    public string? LastName { get; set; }
+    public DateTimeOffset CreatedAt { get; set; } = DateTimeOffset.UtcNow;
+    
+    public ICollection<UserIntegration> Integrations { get; set; } = new List<UserIntegration>();
+    public ICollection<AlertRule> AlertRules { get; set; } = new List<AlertRule>();
+}
+
+public class UserIntegration
+{
+    public Guid Id { get; set; } = Guid.NewGuid();
+    public Guid UserId { get; set; }
+    public User User { get; set; } = null!;
+    public string Provider { get; set; } = string.Empty; // "slack", "email"
+    
+    [Column(TypeName = "jsonb")]
+    public string CredentialsJson { get; set; } = "{}"; // Titkok, Webhook URL-ek
+    
+    public bool IsActive { get; set; } = true;
+}
+
+public class AlertRule
+{
+    public Guid Id { get; set; } = Guid.NewGuid();
+    public Guid UserId { get; set; }
+    public User User { get; set; } = null!;
+    public string Name { get; set; } = string.Empty;
+    public string TopicPattern { get; set; } = string.Empty; // pl. "market.crypto"
+    
+    [Column(TypeName = "jsonb")]
+    public AlertConditions Conditions { get; set; } = new();
+    
+    public bool IsEnabled { get; set; } = true;
+    public ICollection<AlertChannel> Channels { get; set; } = new List<AlertChannel>();
+}
+
+public class AlertConditions
+{
+    public string Asset { get; set; } = string.Empty;     // pl. "BTC"
+    public string Operator { get; set; } = string.Empty;  // "GREATER_THAN", "LESS_THAN"
+    public decimal Value { get; set; }                     // Küszöbérték
+}
+
+public class AlertChannel
+{
+    public Guid Id { get; set; } = Guid.NewGuid();
+    public Guid AlertRuleId { get; set; }
+    public AlertRule AlertRule { get; set; } = null!;
+    public string ChannelType { get; set; } = string.Empty; // "email", "slack"
+    
+    [Column(TypeName = "jsonb")]
+    public string ChannelConfigJson { get; set; } = "{}"; // pl. target_channel
+}
+Körültekintően használja a kódot.
+
+EF Core DbContext & GIN Index konfiguráció
+
+csharp
+using Microsoft.EntityFrameworkCore;
+
+public class AppDbContext : DbContext
+{
+    public AppDbContext(DbContextOptions<AppDbContext> options) : base(options) {}
+
+    public DbSet<User> Users => Set<User>();
+    public DbSet<UserIntegration> UserIntegrations => Set<UserIntegration>();
+    public DbSet<AlertRule> AlertRules => Set<AlertRule>();
+    public DbSet<AlertChannel> AlertChannels => Set<AlertChannel>();
+
+    protected override void OnModelCreating(ModelBuilder modelBuilder)
+    {
+        // Natív PostgreSQL GIN (Generalized Inverted Index) létrehozása a JSONB mezőre
+        modelBuilder.Entity<AlertRule>()
+            .HasIndex(b => b.Conditions)
+            .HasMethod("gin");
+            
+        modelBuilder.Entity<AlertRule>()
+            .HasIndex(b => new { b.TopicPattern, b.IsEnabled });
+    }
+}
+Körültekintően használja a kódot.
+
+3. Adat-Absztrakció és Jövőbeli Redis Gyorsítótárazás (Cache Strategy)
+
+Ahhoz, hogy a Core Rule Engine most közvetlenül a DB-ből dolgozzon, de később egy soros beállítással átválthasson Redis-re, a Decorator mintát (Decorator Pattern) alkalmazzuk egy közös interfész mögött.
+
+Az Adat-elérési Interfész
+
+csharp
+public interface IAlertRuleMatcherRepository
+{
+    Task<IEnumerable<MatchedRuleResult>> GetMatchingRulesAsync(string topicPattern, string asset, decimal value);
+}
+
+public class MatchedRuleResult
+{
+    public Guid UserId { get; set; }
+    public string ChannelType { get; set; } = string.Empty;
+    public string ChannelConfigJson { get; set; } = "{}";
+    public string CredentialsJson { get; set; } = "{}";
+}
+Körültekintően használja a kódot.
+
+1. Fázis: Közvetlen PostgreSQL Megvalósítás (Aktív verzió)
+
+csharp
+public class PostgresAlertRuleMatcherRepository : IAlertRuleMatcherRepository
+{
+    private readonly AppDbContext _context;
+
+    public PostgresAlertRuleMatcherRepository(AppDbContext context)
+    {
+        _context = context;
+    }
+
+    public async Task<IEnumerable<MatchedRuleResult>> GetMatchingRulesAsync(string topicPattern, string asset, decimal value)
+    {
+        // Az EF Core a LINQ-t natív JSONB szűréssé fordítja le a Postgres oldalon
+        return await _context.AlertRules
+            .Where(r => r.TopicPattern == topicPattern && r.IsEnabled)
+            .Where(r => r.Conditions.Asset == asset)
+            .SelectMany(r => r.Channels, (rule, channel) => new { rule, channel })
+            .Join(_context.UserIntegrations,
+                rc => new { rc.rule.UserId, Provider = rc.channel.ChannelType },
+                ui => new { ui.UserId, ui.Provider },
+                (rc, ui) => new MatchedRuleResult
+                {
+                    UserId = rc.rule.UserId,
+                    ChannelType = rc.channel.ChannelType,
+                    ChannelConfigJson = rc.channel.ChannelConfigJson,
+                    CredentialsJson = ui.IsActive ? ui.CredentialsJson : "{}"
+                })
+            .ToListAsync();
+    }
+}
+Körültekintően használja a kódot.
+
+2. Fázis: Jövőbeli Redis Gyorsítótár (Csak be kell kötni, ha eljön az ideje)
+
+Ha a terhelés megköveteli, megírjuk a Decoratort. A Core Rule Engine kódjához hozzá sem kell nyúlni, csak a Dependency Injection-ben (Program.cs) cseréljük ki a regisztrációt.
+csharp
+public class CachedAlertRuleMatcherRepository : IAlertRuleMatcherRepository
+{
+    private readonly IAlertRuleMatcherRepository _postgresRepo;
+    private readonly IDistributedCache _redisCache; // Redis kliens
+
+    public CachedAlertRuleMatcherRepository(IAlertRuleMatcherRepository postgresRepo, IDistributedCache redisCache)
+    {
+        _postgresRepo = postgresRepo;
+        _redisCache = redisCache;
+    }
+
+    public async Task<IEnumerable<MatchedRuleResult>> GetMatchingRulesAsync(string topicPattern, string asset, decimal value)
+    {
+        string cacheKey = $"rules:{topicPattern}:{asset}";
+        
+        // 1. Megpróbáljuk felolvasni Redis-ből
+        var cachedData = await _redisCache.GetStringAsync(cacheKey);
+        if (cachedData != null)
+        {
+            // Cache hit -> Kiértékelés memóriában és visszatérés
+            return DeserializeAndFilter(cachedData, value);
+        }
+
+        // 2. Cache miss -> Lekérjük Postgres-ből, majd elmentjük Redis-be
+        var dbResults = await _postgresRepo.GetMatchingRulesAsync(topicPattern, asset, value);
+        await _redisCache.SetStringAsync(cacheKey, Serialize(dbResults), new DistributedCacheEntryOptions {
+            AbsoluteExpirationRelativeToNow = TimeSpan.FromMinutes(10)
+        });
+
+        return dbResults;
+    }
+}
+Körültekintően használja a kódot.
+
+4. A Core Rule Engine Megvalósítása (.NET BackgroundService)
+
+A Core Engine a RabbitMQ-ból fogyaszt egy aszinkron háttérszolgáltatásként (IHostedService / BackgroundService), végrehajtja az üzleti logikát az absztrakt Repository segítségével, majd továbbítja a feladatokat a csatorna Worker-ek felé.
+
+A bejövő és kimenő Üzenet Formátumok (DTO)
+
+csharp
+public record IncomingEventDto(string Topic, string Asset, decimal ChangePercent, string Title);
+public record DispatchMessageDto(Guid UserId, string ChannelType, string ChannelConfigJson, string CredentialsJson, object Payload);
+Körültekintően használja a kódot.
+
+A Core Rule Engine Szolgáltatás
+
+csharp
+using System.Text;
+using System.Text.Json;
+using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Hosting;
+using RabbitMQ.Client;
+using RabbitMQ.Client.Events;
+
+public class CoreRuleEngineWorker : BackgroundService
+{
+    private readonly IServiceProvider _serviceProvider;
+    private readonly IConnection _rabbitConnection;
+    private readonly IModel _channel;
+
+    public CoreRuleEngineWorker(IServiceProvider serviceProvider, IConnection rabbitConnection)
+    {
+        _serviceProvider = serviceProvider;
+        _rabbitConnection = rabbitConnection;
+        _channel = _rabbitConnection.CreateModel();
+        
+        // RabbitMQ topológia deklaráció
+        _channel.ExchangeDeclare("event-exchange", ExchangeType.Topic, durable: true);
+        _channel.QueueDeclare("core-rules-queue", durable: true, exclusive: false, autoDelete: false);
+        _channel.QueueBind("core-rules-queue", "event-exchange", "market.#");
+        _channel.QueueBind("core-rules-queue", "event-exchange", "news.#");
+        
+        _channel.ExchangeDeclare("dispatch-exchange", ExchangeType.Direct, durable: true);
+    }
+
+    protected override Task ExecuteAsync(CancellationToken stoppingToken)
+    {
+        var consumer = new AsyncEventingBasicConsumer(_channel);
+        consumer.Received += async (model, ea) =>
+        {
+            var body = ea.Body.ToArray();
+            var messageString = Encoding.UTF8.GetString(body);
+            var incomingEvent = JsonSerializer.Deserialize<IncomingEventDto>(messageString);
+
+            if (incomingEvent != null)
+            {
+                // Mivel a BackgroundService Singleton, az EF Core Context miatt Scope-ot kell nyitnunk
+                using var scope = _serviceProvider.CreateScope();
+                var repo = scope.ServiceProvider.GetRequiredService<IAlertRuleMatcherRepository>();
+
+                // Szabályok keresése (Postgres GIN index alapú villámgyors LINQ szűrés)
+                var matches = await repo.GetMatchingRulesAsync(ea.RoutingKey, incomingEvent.Asset, incomingEvent.ChangePercent);
+
+                foreach (var match in matches)
+                {
+                    var dispatchMessage = new DispatchMessageDto(
+                        match.UserId,
+                        match.ChannelType,
+                        match.ChannelConfigJson,
+                        match.CredentialsJson,
+                        new { Title = incomingEvent.Title, Value = incomingEvent.ChangePercent }
+                    );
+
+                    var outputBody = Encoding.UTF8.GetBytes(JsonSerializer.Serialize(dispatchMessage));
+                    
+                    // Küldés a specifikus worker csatornájára (pl. dispatch.slack vagy dispatch.email)
+                    _channel.BasicPublish(
+                        exchange: "dispatch-exchange",
+                        routingKey: $"dispatch.{match.ChannelType}",
+                        basicProperties: null,
+                        body: outputBody
+                    );
+                }
+            }
+
+            _channel.BasicAck(ea.DeliveryTag, multiple: false);
+        };
+
+        _channel.BasicConsume(queue: "core-rules-queue", autoAck: false, consumer: consumer);
+        return Task.CompletedTask;
+    }
+}
+Körültekintően használja a kódot.
+
+5. Dependency Injection Beállítások (Program.cs)
+
+A .NET beépített DI konténerében így konfiguráljuk a rendszert, transzparensen támogatva a későbbi Redis váltást:
+csharp
+var builder = WebApplication.CreateBuilder(args);
+
+// 1. PostgreSQL & EF Core beállítása
+builder.Services.AddDbContext<AppDbContext>(options =>
+    options.UseNpgsql(builder.Configuration.GetConnectionString("PostgresConnection")));
+
+// 2. RabbitMQ Kapcsolat regisztrációja
+builder.Services.AddSingleton<IConnection>(sp => {
+    var factory = new ConnectionFactory() { HostName = "localhost", DispatchConsumersAsync = true };
+    return factory.CreateConnection();
+});
+
+// 3. ADAT-STRATÉGIA REGISZTRÁCIÓ
+// Jelenleg közvetlenül a Postgres Repository fut:
+builder.Services.AddScoped<IAlertRuleMatcherRepository, PostgresAlertRuleMatcherRepository>();
+
+// KÉSŐBBI REDIS VÁLTÁS ESETÉN CSAK EZT AZ ALÁBBI 3 SORT KELL AKTIVÁLNI:
+// builder.Services.AddStackExchangeRedisCache(options => { options.Configuration = "localhost:6379"; });
+// builder.Services.AddScoped<PostgresAlertRuleMatcherRepository>();
+// builder.Services.AddScoped<IAlertRuleMatcherRepository, CachedAlertRuleMatcherRepository>();
+
+// 4. A Háttérben futó Core Engine Worker indítása
+builder.Services.AddHostedService<CoreRuleEngineWorker>();
+
+var app = builder.Build();
+app.Run();
+Körültekintően használja a kódot.
+
+Miért biztosítja ez a terv a brief összes kérését?
+
+1. .NET Core Clean Architecture: A különálló Worker-ek (Email, Slack) teljesen le vannak választva a központi üzleti logikáról a RabbitMQ segítségével.
+2. Rugalmas adatmodell: A PostgreSQL jsonb oszlopai lehetővé teszik új szűrési paraméterek hozzáadását anélkül, hogy az adatbázis sémát (migrációkat) módosítani kellene.
+3. Készen áll a skálázódásra: A Decorator mintával előkészített IAlertRuleMatcherRepository garantálja, hogy ha a rendszer eléri a terhelési limitet, a Redis bevezetése tiszta konfigurációs feladat lesz, nulla kockázattal az üzleti logikára nézve.
