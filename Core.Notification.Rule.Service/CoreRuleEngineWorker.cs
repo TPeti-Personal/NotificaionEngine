@@ -5,29 +5,22 @@ using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
 using RabbitMQ.Client;
 using RabbitMQ.Client.Events;
-using NotificationEngine.Application;
+using NotificationEngine.Application.DTOs;
+using NotificationEngine.Application.Interfaces;
 
 namespace Core.Notification.Rule.Service;
-
-public record IncomingEventDto(string Topic, string Asset, decimal ChangePercent, string Title);
-public record DispatchMessageDto(Guid UserId, string ChannelType, string ChannelConfigJson, string CredentialsJson, object Payload);
-
 public class CoreRuleEngineWorker : BackgroundService
 {
     private readonly IServiceProvider _serviceProvider;
     private readonly IConnection _rabbitConnection;
     private readonly ILogger<CoreRuleEngineWorker> _logger;
-    private IModel? _channel;
+    private readonly IModel _channel;
 
     public CoreRuleEngineWorker(IServiceProvider serviceProvider, IConnection rabbitConnection, ILogger<CoreRuleEngineWorker> logger)
     {
         _serviceProvider = serviceProvider;
         _rabbitConnection = rabbitConnection;
         _logger = logger;
-    }
-
-    protected override Task ExecuteAsync(CancellationToken stoppingToken)
-    {
         _channel = _rabbitConnection.CreateModel();
         
         _channel.ExchangeDeclare("event-exchange", ExchangeType.Topic, durable: true);
@@ -36,7 +29,10 @@ public class CoreRuleEngineWorker : BackgroundService
         _channel.QueueBind("core-rules-queue", "event-exchange", "news.#");
         
         _channel.ExchangeDeclare("dispatch-exchange", ExchangeType.Direct, durable: true);
+    }
 
+    protected override Task ExecuteAsync(CancellationToken stoppingToken)
+    {
         var consumer = new AsyncEventingBasicConsumer(_channel);
         consumer.Received += async (model, ea) =>
         {
@@ -48,8 +44,6 @@ public class CoreRuleEngineWorker : BackgroundService
 
                 if (incomingEvent != null)
                 {
-                    _logger.LogInformation("Processing event: {Topic} for asset {Asset}", ea.RoutingKey, incomingEvent.Asset);
-
                     using var scope = _serviceProvider.CreateScope();
                     var repo = scope.ServiceProvider.GetRequiredService<IAlertRuleMatcherRepository>();
 
@@ -66,33 +60,19 @@ public class CoreRuleEngineWorker : BackgroundService
                         );
 
                         var outputBody = Encoding.UTF8.GetBytes(JsonSerializer.Serialize(dispatchMessage));
-                        
-                        _channel.BasicPublish(
-                            exchange: "dispatch-exchange",
-                            routingKey: $"dispatch.{match.ChannelType}",
-                            basicProperties: null,
-                            body: outputBody
-                        );
+                        _channel.BasicPublish("dispatch-exchange", $"dispatch.{match.ChannelType}", null, outputBody);
                     }
                 }
+                _channel.BasicAck(ea.DeliveryTag, multiple: false);
             }
             catch (Exception ex)
             {
                 _logger.LogError(ex, "Error processing message from queue");
-            }
-            finally
-            {
-                _channel.BasicAck(ea.DeliveryTag, multiple: false);
+                _channel.BasicNack(ea.DeliveryTag, multiple: false, requeue: true);
             }
         };
 
-        _channel.BasicConsume(queue: "core-rules-queue", autoAck: false, consumer: consumer);
+        _channel.BasicConsume("core-rules-queue", autoAck: false, consumer: consumer);
         return Task.CompletedTask;
-    }
-
-    public override void Dispose()
-    {
-        _channel?.Dispose();
-        base.Dispose();
     }
 }

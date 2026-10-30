@@ -1,30 +1,9 @@
 using Microsoft.EntityFrameworkCore;
-using NotificationEngine.Core;
-using NotificationEngine.Application;
+using NotificationEngine.Application.DTOs;
+using NotificationEngine.Application.Interfaces;
+using NotificationEngine.Infrastructure.Persistence;
 
-namespace NotificationEngine.Infrastructure;
-
-public class AppDbContext : DbContext
-{
-    public AppDbContext(DbContextOptions<AppDbContext> options) : base(options) {}
-
-    public DbSet<User> Users => Set<User>();
-    public DbSet<UserIntegration> UserIntegrations => Set<UserIntegration>();
-    public DbSet<AlertRule> AlertRules => Set<AlertRule>();
-    public DbSet<AlertChannel> AlertChannels => Set<AlertChannel>();
-
-    protected override void OnModelCreating(ModelBuilder modelBuilder)
-    {
-        modelBuilder.Entity<AlertRule>()
-            .OwnsOne(b => b.Conditions, builder => {
-                builder.ToJson();
-            });
-
-        modelBuilder.Entity<AlertRule>()
-            .HasIndex(b => new { b.TopicPattern, b.IsEnabled });
-    }
-}
-
+namespace NotificationEngine.Infrastructure.Repositories;
 public class PostgresAlertRuleMatcherRepository : IAlertRuleMatcherRepository
 {
     private readonly AppDbContext _context;
